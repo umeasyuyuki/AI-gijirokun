@@ -1,1 +1,7 @@
+HEAD
+
+__pycache__/
+*.pyc
+*.webm
+539990a (Initial commit)
 .env

@@ -1,10 +1,14 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import openai
+from dotenv import load_dotenv
+import os
+from openai import OpenAI
 import shutil
 import json
 import requests
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -17,12 +21,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# OpenAI APIキー
-openai.api_key = "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"
-
-# Supabase情報（サービスロールキーを使用）
-SUPABASE_URL = "https://taaywqlhffbdvlvfgxez.supabase.co"
-SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRhYXl3cWxoZmZiZHZsdmZneGV6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDMzOTYzMzAsImV4cCI6MjA1ODk3MjMzMH0.ZlZRc5o1hF8j8Uo0KsDiXW1C5m4VBdouv-n_ZI3cb7g"
+# 環境変数からAPIキーなど取得
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 SUPABASE_TABLE = "minute_embeddings"
 
 class SaveMinutesRequest(BaseModel):
@@ -33,19 +35,20 @@ class SaveMinutesRequest(BaseModel):
 
 @app.post("/transcribe")
 async def transcribe_and_analyze(audio: UploadFile = File(...)):
-    # 一時ファイルに録音保存
     audio_path = "./temp_audio.webm"
     with open(audio_path, "wb") as buffer:
         shutil.copyfileobj(audio.file, buffer)
 
-    # Whisper による文字起こし
     with open(audio_path, "rb") as audio_file:
-        transcript = openai.Audio.transcribe("whisper-1", audio_file)["text"]
+        transcript_response = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file
+        )
+    transcript = transcript_response.text
 
-    # 文字起こしの整形
     proofreading_prompt = f"""
     あなたは文字起こしの整形専門アシスタントです。
-    以下の内容を文法的に整理し、読みやすく整えてください。
+    以下を文法的に整理し、読みやすく整えてください。
     ・句読点や改行を適切に入れる
     ・冗長な口語表現を削除
     ・ニュアンスや重要な部分を維持
@@ -53,7 +56,8 @@ async def transcribe_and_analyze(audio: UploadFile = File(...)):
     【文章】
     {transcript}
     """
-    proofreading_response = openai.ChatCompletion.create(
+
+    proofreading_response = client.chat.completions.create(
         model="gpt-4-turbo",
         messages=[{"role": "user", "content": proofreading_prompt}],
         temperature=0.1,
@@ -61,18 +65,12 @@ async def transcribe_and_analyze(audio: UploadFile = File(...)):
     )
     formatted_transcript = proofreading_response.choices[0].message.content
 
-    # ---------------------------
-    # Embedding API により現在の文字起こしからベクトル生成
-    # ---------------------------
-    embedding_response = openai.Embedding.create(
-        input=formatted_transcript,
+    embedding_response = client.embeddings.create(
+        input=[formatted_transcript],
         model="text-embedding-ada-002"
     )
-    query_embedding = embedding_response["data"][0]["embedding"]
+    query_embedding = embedding_response.data[0].embedding
 
-    # ---------------------------
-    # Supabase の RPC 関数 match_minutes を呼び出し、ベクトル検索
-    # ---------------------------
     headers = {
         "apikey": SUPABASE_SERVICE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
@@ -80,8 +78,8 @@ async def transcribe_and_analyze(audio: UploadFile = File(...)):
     }
     rpc_payload = {
         "query_embedding": query_embedding,
-        "match_threshold": 0.2,  # 適宜調整してください
-        "match_count": 5         # 上位5件を取得
+        "match_threshold": 0.2,
+        "match_count": 5
     }
     rpc_response = requests.post(
         f"{SUPABASE_URL}/rest/v1/rpc/match_minutes",
@@ -89,13 +87,18 @@ async def transcribe_and_analyze(audio: UploadFile = File(...)):
         json=rpc_payload
     )
     matched_minutes = rpc_response.json()
-    past_analysis_texts = "\n\n".join(
-        minute["analysis"] for minute in matched_minutes if "analysis" in minute
-    )
 
-    # ---------------------------
-    # 議事録作成のプロンプト作成（タイトルも生成）
-    # ---------------------------
+    if isinstance(matched_minutes, list):
+        if matched_minutes and isinstance(matched_minutes[0], dict):
+            past_analysis_texts = "\n\n".join(minute.get("analysis", "") for minute in matched_minutes)
+        elif matched_minutes and isinstance(matched_minutes[0], str):
+            past_analysis_texts = "\n\n".join(matched_minutes)
+        else:
+            past_analysis_texts = ""
+    else:
+        print("⚠️ matched_minutes の中身:", matched_minutes)
+        raise ValueError("SupabaseのRPC match_minutes からの戻り値が想定外の形式です。")
+
     analysis_prompt = f"""
     あなたは企業の戦略会議を専門とする高度な議事録作成アシスタントです。
 
@@ -115,13 +118,11 @@ async def transcribe_and_analyze(audio: UploadFile = File(...)):
     ■要因分析（課題や成功/失敗要因を明確に分析）
     ■事実と解釈の仕分け（事実情報と主観的解釈を分離して整理）
 
-    また、過去の議事録を踏まえた具体的な改善案も提示し、関連性を示したマインドマップを作成してください。
-
-    出力は以下のJSON形式のみで返してください。
+    出力は以下のJSON形式のみで返してください：
 
     {{
         "タイトル": "この会議のタイトル",
-        "議事録": "会議サマリー、決定事項、課題・懸念点、今後の方針・アクションプラン、要因分析、事実と解釈の仕分けを含めた本文",
+        "議事録": "サマリー、決定事項、課題・懸念点、今後の方針・アクションプラン、要因分析、事実と解釈の仕分けを含む本文",
         "改善案": "過去データを踏まえた具体的改善案",
         "マインドマップ": {{
             "name": "会議",
@@ -143,13 +144,15 @@ async def transcribe_and_analyze(audio: UploadFile = File(...)):
         }}
     }}
     """
-    analysis_response = openai.ChatCompletion.create(
+
+    analysis_response = client.chat.completions.create(
         model="gpt-4-turbo",
         messages=[{"role": "user", "content": analysis_prompt}],
         temperature=0.2,
         max_tokens=2000
     )
     analysis_raw = analysis_response.choices[0].message.content.strip()
+
     try:
         analysis_json = json.loads(analysis_raw)
     except json.JSONDecodeError as e:
@@ -165,12 +168,11 @@ async def transcribe_and_analyze(audio: UploadFile = File(...)):
 
 @app.post("/save-minutes")
 async def save_minutes(data: SaveMinutesRequest):
-    # 議事録保存時にも、整形済み文字起こしからembedding生成
-    embedding_response = openai.Embedding.create(
-        input=data.formatted_transcript,
+    embedding_response = client.embeddings.create(
+        input=[data.formatted_transcript],
         model="text-embedding-ada-002"
     )
-    embedding_vector = embedding_response["data"][0]["embedding"]
+    embedding_vector = embedding_response.data[0].embedding
     payload = data.dict()
     payload["embedding"] = embedding_vector
 
