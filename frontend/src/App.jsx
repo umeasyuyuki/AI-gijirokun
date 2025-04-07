@@ -28,7 +28,7 @@ function App() {
   // --------------------------
   const fetchSavedMinutes = async () => {
     try {
-     const res = await fetch(`${import.meta.env.VITE_API_URL}/get-minutes`);
+     const res = await fetch(`${process.env.REACT_APP_API_URL}/get-minutes`);
       if (!res.ok) throw new Error('保存された議事録の取得に失敗しました');
       const data = await res.json();
       // 直近のものが上になるようソート（id降順）
@@ -51,7 +51,7 @@ function App() {
     formData.append('audio', audioBlob, 'recording.webm');
     try {
       setLoading(true);
-      const res = await fetch(`${import.meta.env.VITE_API_URL}/transcribe`, {
+      const res = await fetch(`${process.env.REACT_APP_API_URL}/transcribe`, {
         method: 'POST',
         body: formData,
       });
@@ -75,7 +75,7 @@ function App() {
   // --------------------------
   const saveToDatabase = async () => {
     try {
-     const res = await fetch(`${import.meta.env.VITE_API_URL}/save-minutes`, {
+     const res = await fetch(`${process.env.REACT_APP_API_URL}/save-minutes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
